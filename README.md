@@ -6,6 +6,8 @@ You can paste images into Claude Code's chat, but sometimes you need the screens
 
 ![Linux](https://img.shields.io/badge/platform-Linux-blue) ![macOS](https://img.shields.io/badge/platform-macOS-blue) ![Windows](https://img.shields.io/badge/platform-Windows-blue)
 
+![Screenshot Manager](docs/screenshot.png)
+
 ## What it does
 
 Type `/screenshots` in Claude Code and a GUI window opens where you can:
