@@ -1,465 +1,590 @@
 #!/usr/bin/env python3
-"""Screenshot Clipboard Manager — capture, name, and save clipboard images."""
+"""Screenshot Manager — capture, name, and save clipboard images via browser UI."""
 
-import tkinter as tk
-from tkinter import ttk, messagebox
-import subprocess
+import base64
+import html
 import json
-import io
 import os
+import secrets
+import socket
+import struct
 import sys
+import threading
+import time
+import webbrowser
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
-try:
-    from PIL import Image, ImageTk
-except ImportError:
-    print("Pillow is required: pip install Pillow")
-    sys.exit(1)
+# ── Globals set at startup ──────────────────────────────────────────────────
+SAVE_DIR = ""
+CSRF_TOKEN = ""
+server_instance = None
+last_ping = 0.0
+
+HTML_PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Screenshot Manager</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #1a1b2e; --bg-panel: #232436; --bg-card: #2a2b3d;
+    --bg-input: #1e1f32; --fg: #e0e0f0; --fg-dim: #6a6b8a;
+    --accent: #7289da; --accent-hover: #8299ea; --border: #3a3b5a;
+    --red: #e06070; --thumb-size: 120px;
+  }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Ubuntu, Cantarell, sans-serif;
+    background: var(--bg); color: var(--fg);
+    display: flex; flex-direction: column; height: 100vh; overflow: hidden;
+    user-select: none;
+  }
+  /* Header */
+  .header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 20px 10px;
+  }
+  .header h1 { font-size: 18px; font-weight: 700; }
+  .header .save-dir { font-size: 11px; color: var(--fg-dim); margin-top: 2px; }
+  .btn {
+    border: none; border-radius: 6px; cursor: pointer;
+    font-size: 13px; font-weight: 600; padding: 10px 20px;
+    transition: background 0.15s;
+  }
+  .btn-accent { background: var(--accent); color: #fff; }
+  .btn-accent:hover { background: var(--accent-hover); }
+  .btn-default { background: var(--bg-card); color: var(--fg); }
+  .btn-default:hover { background: var(--bg-panel); }
+  .btn-danger { background: var(--bg-card); color: var(--red); font-size: 11px; padding: 6px 14px; }
+  .btn-danger:hover { background: var(--bg-panel); }
+  .sep { height: 1px; background: var(--border); }
+  /* Main layout */
+  .main {
+    display: flex; flex: 1; overflow: hidden;
+  }
+  /* Thumbnail strip */
+  .thumbs {
+    width: 170px; min-width: 170px; background: var(--bg-panel);
+    overflow-y: auto; padding: 10px;
+  }
+  .thumb {
+    border: 3px solid var(--border); border-radius: 6px;
+    margin-bottom: 10px; cursor: pointer; overflow: hidden;
+    transition: border-color 0.15s;
+  }
+  .thumb.selected { border-color: var(--accent); }
+  .thumb img {
+    display: block; width: 100%; height: auto;
+    pointer-events: none;
+  }
+  /* Preview area */
+  .preview-area {
+    flex: 1; background: var(--bg-panel); display: flex;
+    flex-direction: column; align-items: center; justify-content: center;
+    padding: 20px; overflow: hidden;
+  }
+  .empty-state {
+    color: var(--fg-dim); text-align: center; font-size: 13px; line-height: 2;
+  }
+  .preview-img {
+    max-width: 100%; max-height: calc(100% - 100px);
+    object-fit: contain; border-radius: 4px;
+  }
+  .preview-info {
+    color: var(--fg-dim); font-size: 12px; margin-top: 8px;
+  }
+  .name-row {
+    display: flex; align-items: center; margin-top: 10px; gap: 8px;
+  }
+  .name-row label { font-size: 14px; font-weight: 600; }
+  .name-row input {
+    flex: 1; background: var(--bg-input); border: 1px solid var(--border);
+    border-radius: 4px; color: var(--fg); font-size: 14px;
+    padding: 8px 12px; outline: none; min-width: 0;
+  }
+  .name-row input:focus { border-color: var(--accent); }
+  .name-row .ext { color: var(--fg-dim); font-size: 14px; }
+  .remove-row { margin-top: 8px; align-self: flex-start; }
+  /* Bottom bar */
+  .bottom {
+    display: flex; align-items: center; padding: 14px 20px;
+  }
+  .bottom .status { font-size: 11px; color: var(--fg-dim); flex: 1; }
+  .bottom .actions { display: flex; gap: 10px; }
+  /* Scrollbar */
+  .thumbs::-webkit-scrollbar { width: 6px; }
+  .thumbs::-webkit-scrollbar-track { background: var(--bg-panel); }
+  .thumbs::-webkit-scrollbar-thumb { background: var(--bg-card); border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div>
+    <h1>Screenshot Manager</h1>
+    <div class="save-dir">Saving to: {{SAVE_DIR}}</div>
+  </div>
+  <button class="btn btn-accent" onclick="pasteImage()">Capture (Ctrl+V)</button>
+</div>
+<div class="sep"></div>
+
+<div class="main">
+  <div class="thumbs" id="thumbs"></div>
+  <div class="preview-area" id="previewArea">
+    <div class="empty-state" id="emptyState">
+      No screenshots yet.<br><br>
+      Take a screenshot, then press<br>Ctrl+V or click Capture.
+    </div>
+    <img class="preview-img" id="previewImg" style="display:none">
+    <div class="preview-info" id="previewInfo" style="display:none"></div>
+    <div class="name-row" id="nameRow" style="display:none">
+      <label>Name:</label>
+      <input type="text" id="nameInput" spellcheck="false">
+      <span class="ext">.png</span>
+    </div>
+    <div class="remove-row" id="removeRow" style="display:none">
+      <button class="btn btn-danger" onclick="removeSelected()">Remove this screenshot</button>
+    </div>
+  </div>
+</div>
+
+<div class="sep"></div>
+<div class="bottom">
+  <div class="status" id="status">Ready &mdash; Ctrl+V to capture</div>
+  <div class="actions">
+    <button class="btn btn-default" onclick="discardAll()">Discard All</button>
+    <button class="btn btn-accent" onclick="saveAll()">Save All &amp; Close (Ctrl+S)</button>
+  </div>
+</div>
+
+<script>
+const CSRF = "{{CSRF_TOKEN}}";
+const images = [];   // {dataUrl, name, width, height}
+let selected = -1;
+let counter = 0;
+
+// ── Heartbeat ──────────────────────────────────────────────────────────────
+setInterval(() => {
+  fetch("/ping", {method: "GET"}).catch(() => {});
+}, 3000);
+
+window.addEventListener("beforeunload", () => {
+  navigator.sendBeacon("/close", new URLSearchParams({csrf: CSRF}));
+});
+
+// ── Paste handling ─────────────────────────────────────────────────────────
+document.addEventListener("paste", e => {
+  // If the name input is focused, only handle if there are image items
+  if (document.activeElement === document.getElementById("nameInput")) {
+    // Let normal text paste through if no images in clipboard
+    if (!e.clipboardData || !e.clipboardData.items) return;
+    let hasImage = false;
+    for (const item of e.clipboardData.items) {
+      if (item.type.startsWith("image/")) { hasImage = true; break; }
+    }
+    if (!hasImage) return;
+  }
+  if (!e.clipboardData || !e.clipboardData.items) return;
+  for (const item of e.clipboardData.items) {
+    if (item.type.startsWith("image/")) {
+      e.preventDefault();
+      const blob = item.getAsFile();
+      if (blob) handleImageBlob(blob);
+      return;
+    }
+  }
+  setStatus("No image in clipboard");
+});
+
+function pasteImage() {
+  // Trigger a clipboard read via the Clipboard API
+  if (navigator.clipboard && navigator.clipboard.read) {
+    navigator.clipboard.read().then(items => {
+      for (const item of items) {
+        for (const type of item.types) {
+          if (type.startsWith("image/")) {
+            item.getType(type).then(blob => handleImageBlob(blob));
+            return;
+          }
+        }
+      }
+      setStatus("No image in clipboard");
+    }).catch(() => {
+      setStatus("Clipboard access denied — use Ctrl+V instead");
+    });
+  } else {
+    setStatus("Use Ctrl+V to paste");
+  }
+}
+
+function handleImageBlob(blob) {
+  // Normalize to PNG via canvas
+  const img = new Image();
+  const url = URL.createObjectURL(blob);
+  img.onload = () => {
+    const canvas = document.createElement("canvas");
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+    canvas.getContext("2d").drawImage(img, 0, 0);
+    const dataUrl = canvas.toDataURL("image/png");
+    URL.revokeObjectURL(url);
+
+    counter++;
+    const entry = {
+      dataUrl,
+      name: "screenshot-" + counter,
+      width: img.naturalWidth,
+      height: img.naturalHeight
+    };
+    images.push(entry);
+    addThumb(images.length - 1);
+    selectImage(images.length - 1);
+    setStatus("Captured #" + counter + " (" + entry.width + "\u00d7" + entry.height + ") \u2014 " + images.length + " total");
+  };
+  img.src = url;
+}
+
+// ── Thumbnail strip ────────────────────────────────────────────────────────
+function addThumb(idx) {
+  const div = document.createElement("div");
+  div.className = "thumb";
+  div.dataset.idx = idx;
+  div.onclick = () => selectImage(idx);
+  const img = document.createElement("img");
+  img.src = images[idx].dataUrl;
+  div.appendChild(img);
+  document.getElementById("thumbs").appendChild(div);
+}
+
+function rebuildThumbs() {
+  const container = document.getElementById("thumbs");
+  container.innerHTML = "";
+  images.forEach((_, i) => addThumb(i));
+  // Re-highlight
+  document.querySelectorAll(".thumb").forEach((el, i) => {
+    el.classList.toggle("selected", i === selected);
+  });
+}
+
+// ── Selection / Preview ────────────────────────────────────────────────────
+function selectImage(idx) {
+  // Save current name
+  commitName();
+  selected = idx;
+  const entry = images[idx];
+
+  // Highlight thumb
+  document.querySelectorAll(".thumb").forEach((el, i) => {
+    el.classList.toggle("selected", i === idx);
+  });
+
+  // Show preview
+  document.getElementById("emptyState").style.display = "none";
+  const prevImg = document.getElementById("previewImg");
+  prevImg.src = entry.dataUrl;
+  prevImg.style.display = "block";
+  document.getElementById("previewInfo").textContent = entry.width + " \u00d7 " + entry.height + " px";
+  document.getElementById("previewInfo").style.display = "block";
+  document.getElementById("nameRow").style.display = "flex";
+  document.getElementById("removeRow").style.display = "block";
+
+  const nameInput = document.getElementById("nameInput");
+  nameInput.value = entry.name;
+  nameInput.focus();
+  nameInput.select();
+}
+
+function commitName() {
+  if (selected >= 0 && selected < images.length) {
+    const val = document.getElementById("nameInput").value.trim();
+    if (val) images[selected].name = val;
+  }
+}
+
+function removeSelected() {
+  if (selected < 0) return;
+  images.splice(selected, 1);
+  if (images.length === 0) {
+    selected = -1;
+    document.getElementById("previewImg").style.display = "none";
+    document.getElementById("previewInfo").style.display = "none";
+    document.getElementById("nameRow").style.display = "none";
+    document.getElementById("removeRow").style.display = "none";
+    document.getElementById("emptyState").style.display = "block";
+  } else {
+    selected = Math.min(selected, images.length - 1);
+  }
+  rebuildThumbs();
+  if (selected >= 0) selectImage(selected);
+  setStatus("Removed \u2014 " + images.length + " remaining");
+}
+
+// ── Actions ────────────────────────────────────────────────────────────────
+function showDoneOverlay(msg) {
+  const overlay = document.createElement("div");
+  overlay.style.cssText = "position:fixed;top:0;left:0;right:0;bottom:0;width:100vw;height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:99999;background:#1a1b2e;color:#e0e0f0;";
+  overlay.innerHTML = '<div style="font-size:72px;margin-bottom:24px;color:#7289da;">&#10004;</div>' +
+    '<div style="font-size:28px;font-weight:700;margin-bottom:16px;color:#e0e0f0;">' + msg + '</div>' +
+    '<div style="font-size:15px;color:#6a6b8a;">You can close this tab now.</div>';
+  document.body.appendChild(overlay);
+}
+
+function saveAll() {
+  commitName();
+  const payload = images.map(e => ({
+    name: e.name,
+    dataUrl: e.dataUrl,
+    width: e.width,
+    height: e.height
+  }));
+  fetch("/save", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({csrf: CSRF, images: payload})
+  }).then(() => {
+    document.title = "Screenshot Manager (saved)";
+    showDoneOverlay("Saved!");
+  }).catch(() => {
+    setStatus("Save failed \u2014 check the terminal for errors");
+  });
+}
+
+function discardAll() {
+  if (images.length > 0 && !confirm("Discard all screenshots without saving?")) return;
+  document.title = "Screenshot Manager (discarded)";
+  showDoneOverlay("Discarded.");
+  fetch("/discard", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({csrf: CSRF})
+  }).catch(() => {});
+}
+
+function setStatus(msg) {
+  document.getElementById("status").textContent = msg;
+}
+
+// ── Keyboard shortcuts ─────────────────────────────────────────────────────
+document.addEventListener("keydown", e => {
+  if (e.ctrlKey && e.key === "s") {
+    e.preventDefault();
+    saveAll();
+  } else if (e.key === "Escape") {
+    e.preventDefault();
+    discardAll();
+  }
+});
+</script>
+</body>
+</html>"""
 
 
-def grab_clipboard_image():
-    """Get an image from the system clipboard."""
-    # Windows and macOS: Pillow's ImageGrab handles it natively
-    if sys.platform in ("win32", "darwin"):
-        try:
-            from PIL import ImageGrab
-            img = ImageGrab.grabclipboard()
-            if isinstance(img, Image.Image):
-                return img
-        except Exception:
-            pass
-        return None
-
-    # Linux: try command-line clipboard tools
-    for cmd in [
-        ["wl-paste", "--type", "image/png"],
-        ["xclip", "-selection", "clipboard", "-t", "image/png", "-o"],
-    ]:
-        try:
-            result = subprocess.run(cmd, capture_output=True, timeout=2)
-            if result.returncode == 0 and result.stdout:
-                return Image.open(io.BytesIO(result.stdout))
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            continue
-    return None
+def png_dimensions(data):
+    """Read width and height from a PNG header without Pillow."""
+    if data[:8] != b'\x89PNG\r\n\x1a\n':
+        return None, None
+    width, height = struct.unpack('>II', data[16:24])
+    return width, height
 
 
-class ScreenshotManager:
-    # Color palette
-    BG = "#1a1b2e"
-    BG_PANEL = "#232436"
-    BG_CARD = "#2a2b3d"
-    BG_INPUT = "#1e1f32"
-    FG = "#e0e0f0"
-    FG_DIM = "#6a6b8a"
-    ACCENT = "#7289da"
-    ACCENT_HOVER = "#8299ea"
-    BORDER = "#3a3b5a"
-    RED = "#e06070"
-    THUMB_SELECTED = "#7289da"
-    THUMB_BORDER = "#3a3b5a"
+class Handler(BaseHTTPRequestHandler):
+    """HTTP request handler for the screenshot manager."""
 
-    THUMB_SIZE = (120, 90)
-    PREVIEW_MAX = (600, 450)
+    def log_message(self, format, *args):
+        # Silence default request logging
+        pass
 
-    @staticmethod
-    def _pick_font():
-        """Pick the best available sans-serif font for the platform."""
-        if sys.platform == "darwin":
-            return "Helvetica Neue"
-        elif sys.platform == "win32":
-            return "Segoe UI"
-        else:
-            # Linux — try common options
-            import tkinter.font as tkfont
-            families = set(tkfont.families())
-            for name in ("Inter", "Ubuntu", "Cantarell",
-                         "Noto Sans", "DejaVu Sans"):
-                if name in families:
-                    return name
-            return "sans-serif"
-
-    def __init__(self, save_dir):
-        self.save_dir = save_dir
-        self.images = []       # list of {image, name_var, thumb_photo}
-        self.selected = -1
-        self.counter = 0
-
-        self.root = tk.Tk()
-        self.root.title("Screenshot Manager")
-        self.root.geometry("900x680")
-        self.root.minsize(700, 500)
-        self.root.configure(bg=self.BG)
-
-        self._setup_theme()
-        self._build_ui()
-        self._bind_keys()
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-
-    def _setup_theme(self):
-        style = ttk.Style()
-        style.theme_use("clam")
-        font = self._pick_font()
-
-        style.configure(".", background=self.BG, foreground=self.FG,
-                        borderwidth=0, focuscolor=self.ACCENT)
-
-        style.configure("TFrame", background=self.BG)
-        style.configure("Panel.TFrame", background=self.BG_PANEL)
-
-        style.configure("TLabel", background=self.BG, foreground=self.FG,
-                        font=(font, 13))
-        style.configure("Header.TLabel", background=self.BG,
-                        foreground=self.FG, font=(font, 18, "bold"))
-        style.configure("Dim.TLabel", background=self.BG,
-                        foreground=self.FG_DIM, font=(font, 11))
-        style.configure("PanelDim.TLabel", background=self.BG_PANEL,
-                        foreground=self.FG_DIM, font=(font, 11))
-        style.configure("Panel.TLabel", background=self.BG_PANEL,
-                        foreground=self.FG, font=(font, 13))
-        style.configure("Preview.TLabel", background=self.BG_PANEL,
-                        foreground=self.FG_DIM, font=(font, 12))
-        style.configure("Name.TLabel", background=self.BG_PANEL,
-                        foreground=self.FG, font=(font, 14))
-
-        style.configure("Accent.TButton", background=self.ACCENT,
-                        foreground="#ffffff", font=(font, 13, "bold"),
-                        padding=(24, 14))
-        style.map("Accent.TButton",
-                  background=[("active", self.ACCENT_HOVER)])
-
-        style.configure("TButton", background=self.BG_CARD,
-                        foreground=self.FG, font=(font, 13),
-                        padding=(20, 14))
-        style.map("TButton",
-                  background=[("active", self.BG_PANEL)])
-
-        style.configure("Small.TButton", background=self.BG_CARD,
-                        foreground=self.RED, font=(font, 11),
-                        padding=(14, 8))
-        style.map("Small.TButton",
-                  background=[("active", self.BG_PANEL)])
-
-        style.configure("TEntry", fieldbackground=self.BG_INPUT,
-                        foreground=self.FG, insertcolor=self.FG,
-                        font=(font, 14), padding=(12, 10))
-
-        style.configure("TSeparator", background=self.BORDER)
-
-        style.configure("Vertical.TScrollbar",
-                        background=self.BG_CARD, troughcolor=self.BG_PANEL,
-                        borderwidth=0, arrowsize=0)
-        style.map("Vertical.TScrollbar",
-                  background=[("active", self.BORDER)])
-
-    def _on_close(self):
-        print(json.dumps({"action": "closed", "directory": self.save_dir,
-                          "files": []}))
-        self.root.destroy()
-
-    def _build_ui(self):
-        # Header
-        header = ttk.Frame(self.root, padding=(20, 16, 20, 10))
-        header.pack(fill="x")
-        ttk.Label(header, text="Screenshot Manager",
-                  style="Header.TLabel").pack(side="left")
-        ttk.Button(header, text="Capture (Ctrl+V)", style="Accent.TButton",
-                   command=self.capture).pack(side="right")
-
-        # Subtitle
-        sub = ttk.Frame(self.root, padding=(20, 0, 20, 10))
-        sub.pack(fill="x")
-        ttk.Label(sub, text=f"Saving to: {self.save_dir}",
-                  style="Dim.TLabel").pack(side="left")
-
-        ttk.Separator(self.root).pack(fill="x")
-
-        # Main content: thumbnail strip (left) + preview (right)
-        self.content = ttk.Frame(self.root)
-        self.content.pack(fill="both", expand=True)
-        self.content.columnconfigure(1, weight=1)
-        self.content.rowconfigure(0, weight=1)
-
-        # --- Left: thumbnail strip ---
-        left = ttk.Frame(self.content, style="Panel.TFrame")
-        left.grid(row=0, column=0, sticky="nsew")
-
-        thumb_container = ttk.Frame(left, style="Panel.TFrame")
-        thumb_container.pack(fill="both", expand=True)
-
-        self.thumb_canvas = tk.Canvas(thumb_container, width=150,
-                                      highlightthickness=0,
-                                      bg=self.BG_PANEL, bd=0)
-        thumb_scroll = ttk.Scrollbar(thumb_container, orient="vertical",
-                                     command=self.thumb_canvas.yview)
-        self.thumb_frame = ttk.Frame(self.thumb_canvas, style="Panel.TFrame")
-
-        self.thumb_frame.bind(
-            "<Configure>",
-            lambda e: self.thumb_canvas.configure(
-                scrollregion=self.thumb_canvas.bbox("all")))
-        self.thumb_canvas.create_window((0, 0), window=self.thumb_frame,
-                                        anchor="nw", tags="tf")
-        self.thumb_canvas.bind(
-            "<Configure>",
-            lambda e: self.thumb_canvas.itemconfig("tf", width=e.width))
-
-        self.thumb_canvas.pack(side="left", fill="both", expand=True)
-        thumb_scroll.pack(side="right", fill="y")
-        self.thumb_canvas.configure(yscrollcommand=thumb_scroll.set)
-
-        # Mousewheel on thumbnails
-        self.thumb_canvas.bind("<Button-4>",
-                               lambda e: self.thumb_canvas.yview_scroll(-1, "units"))
-        self.thumb_canvas.bind("<Button-5>",
-                               lambda e: self.thumb_canvas.yview_scroll(1, "units"))
-
-        # --- Right: preview area ---
-        self.right = ttk.Frame(self.content, style="Panel.TFrame",
-                               padding=(20, 20))
-        self.right.grid(row=0, column=1, sticky="nsew")
-        self.right.columnconfigure(0, weight=1)
-        self.right.rowconfigure(0, weight=1)
-
-        # Empty state (shown in the right panel)
-        self.empty_label = ttk.Label(
-            self.right,
-            text=("No screenshots yet.\n\n"
-                  "Take a screenshot, then press\n"
-                  "Ctrl+V or click Capture."),
-            justify="center", style="PanelDim.TLabel")
-        self.empty_label.grid(row=0, column=0, rowspan=4)
-
-        # Preview image (hidden initially)
-        self.preview_label = ttk.Label(self.right, style="Panel.TLabel")
-        self.preview_photo = None
-
-        # Info label under preview
-        self.info_var = tk.StringVar()
-        self.info_label = ttk.Label(self.right, textvariable=self.info_var,
-                                    style="PanelDim.TLabel")
-
-        # Name entry under preview
-        self.name_frame = ttk.Frame(self.right, style="Panel.TFrame")
-        self.name_frame.columnconfigure(1, weight=1)
-        ttk.Label(self.name_frame, text="Name:",
-                  style="Name.TLabel").grid(row=0, column=0, padx=(0, 10))
-        self.name_entry = ttk.Entry(self.name_frame)
-        self.name_entry.grid(row=0, column=1, sticky="ew")
-        ttk.Label(self.name_frame, text=".png",
-                  style="PanelDim.TLabel").grid(row=0, column=2, padx=(6, 0))
-
-        # Discard single button
-        self.discard_btn = ttk.Button(self.right, text="Remove this screenshot",
-                                      style="Small.TButton",
-                                      command=self._discard_selected)
-
-        # Bottom bar
-        ttk.Separator(self.root).pack(fill="x")
-        bottom = ttk.Frame(self.root, padding=(20, 14, 20, 18))
-        bottom.pack(fill="x")
-
-        ttk.Button(bottom, text="Save All & Close", style="Accent.TButton",
-                   command=self.save_all).pack(side="right", padx=(10, 0))
-        ttk.Button(bottom, text="Discard All",
-                   command=self.discard_all).pack(side="right")
-
-        self.status_var = tk.StringVar(value="Ready — Ctrl+V to capture")
-        ttk.Label(bottom, textvariable=self.status_var,
-                  style="Dim.TLabel").pack(side="left")
-
-    def _bind_keys(self):
-        self.root.bind_all("<Control-v>", self._on_paste)
-        self.root.bind("<Control-s>", lambda e: self.save_all())
-        self.root.bind("<Escape>", lambda e: self._on_close())
-        self.name_entry.bind("<Return>", lambda e: self._commit_name())
-
-    def _on_paste(self, event):
-        """Ctrl+V: if focus is on a text entry, let default paste through; otherwise capture."""
-        if event.widget is self.name_entry:
-            return  # let tkinter handle normal text paste
-        self.capture()
-
-    def _commit_name(self):
-        """Save the current name entry back to the selected image's name_var."""
-        if 0 <= self.selected < len(self.images):
-            self.images[self.selected]["name_var"].set(
-                self.name_entry.get().strip())
-
-    def capture(self):
-        image = grab_clipboard_image()
-        if image is None:
-            self.status_var.set("No image in clipboard")
-            messagebox.showinfo(
-                "No Image",
-                "No image found in clipboard.\n\n"
-                "Take a screenshot first (PrtSc, or your screenshot tool),\n"
-                "then come back and press Ctrl+V.")
+    def do_GET(self):
+        global last_ping
+        if self.path == "/ping":
+            last_ping = time.monotonic()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"pong")
             return
 
-        self.counter += 1
-        default_name = f"screenshot-{self.counter}"
-
-        # Make thumbnail
-        thumb = image.copy()
-        thumb.thumbnail(self.THUMB_SIZE, Image.LANCZOS)
-        thumb_photo = ImageTk.PhotoImage(thumb)
-
-        name_var = tk.StringVar(value=default_name)
-        entry = {"image": image, "name_var": name_var,
-                 "thumb_photo": thumb_photo, "index": self.counter}
-        self.images.append(entry)
-
-        # Add thumbnail to the strip
-        idx = len(self.images) - 1
-        self._add_thumb_widget(entry, idx)
-
-        # Select the new one
-        self._select(idx)
-
-        w, h = image.size
-        self.status_var.set(
-            f"Captured #{self.counter} ({w}x{h}) — {len(self.images)} total")
-
-    def _add_thumb_widget(self, entry, idx):
-        """Create a clickable thumbnail in the left strip."""
-        frame = tk.Frame(self.thumb_frame, bg=self.THUMB_BORDER,
-                         padx=3, pady=3)
-        frame.pack(padx=10, pady=(10, 0))
-
-        lbl = tk.Label(frame, image=entry["thumb_photo"],
-                       bg=self.BG_PANEL, cursor="hand2")
-        lbl.pack()
-
-        lbl.bind("<Button-1>", lambda e, i=idx: self._select(i))
-        entry["thumb_frame"] = frame
-        entry["thumb_label"] = lbl
-
-    def _select(self, idx):
-        """Select a thumbnail and show its preview."""
-        # Save current name before switching
-        self._commit_name()
-
-        self.selected = idx
-        entry = self.images[idx]
-
-        # Highlight selected thumb
-        for i, e in enumerate(self.images):
-            border_color = self.THUMB_SELECTED if i == idx else self.THUMB_BORDER
-            e["thumb_frame"].configure(bg=border_color)
-
-        # Hide empty state, show preview widgets
-        self.empty_label.grid_forget()
-
-        # Generate preview
-        preview = entry["image"].copy()
-        preview.thumbnail(self.PREVIEW_MAX, Image.LANCZOS)
-        self.preview_photo = ImageTk.PhotoImage(preview)
-        self.preview_label.configure(image=self.preview_photo)
-        self.preview_label.grid(row=0, column=0, sticky="nsew", pady=(0, 12))
-
-        # Info
-        w, h = entry["image"].size
-        self.info_var.set(f"{w} x {h} px")
-        self.info_label.grid(row=1, column=0, sticky="w", pady=(0, 8))
-
-        # Name
-        self.name_frame.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-        self.name_entry.delete(0, tk.END)
-        self.name_entry.insert(0, entry["name_var"].get())
-        self.name_entry.focus_set()
-        self.name_entry.select_range(0, tk.END)
-
-        # Discard button
-        self.discard_btn.grid(row=3, column=0, sticky="w", pady=(4, 0))
-
-    def _discard_selected(self):
-        if self.selected < 0:
+        if self.path == "/":
+            page = HTML_PAGE.replace("{{SAVE_DIR}}", html.escape(SAVE_DIR))
+            page = page.replace("{{CSRF_TOKEN}}", CSRF_TOKEN)
+            body = page.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
 
-        idx = self.selected
-        entry = self.images.pop(idx)
-        entry["thumb_frame"].destroy()
+        self.send_error(404)
 
-        if not self.images:
-            self.selected = -1
-            self.preview_label.grid_forget()
-            self.info_label.grid_forget()
-            self.name_frame.grid_forget()
-            self.discard_btn.grid_forget()
-            self.empty_label.grid(row=0, column=0, rowspan=4)
-        else:
-            new_idx = min(idx, len(self.images) - 1)
-            # Rebind click indices
-            for i, e in enumerate(self.images):
-                e["thumb_label"].bind(
-                    "<Button-1>", lambda ev, j=i: self._select(j))
-            self._select(new_idx)
+    def do_POST(self):
+        global last_ping
 
-        self.status_var.set(f"Removed — {len(self.images)} remaining")
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length)
 
-    def save_all(self):
-        self._commit_name()
-
-        if not self.images:
-            print(json.dumps({"action": "saved", "directory": self.save_dir,
-                              "files": []}))
-            self.root.destroy()
-            return
-
-        saved = []
-        for entry in self.images:
-            name = entry["name_var"].get().strip() or f"screenshot-{entry['index']}"
-            name = "".join(
-                c for c in name if c.isalnum() or c in "-_. ").strip()
-            name = name.lstrip(". ")
-            if not name:
-                name = f"screenshot-{entry['index']}"
-
-            filepath = os.path.join(self.save_dir, f"{name}.png")
-
-            if os.path.exists(filepath):
-                base = name
-                i = 1
-                while os.path.exists(
-                        os.path.join(self.save_dir, f"{base}-{i}.png")):
-                    i += 1
-                filepath = os.path.join(self.save_dir, f"{base}-{i}.png")
-
-            try:
-                w, h = entry["image"].size
-                entry["image"].save(filepath, "PNG")
-                saved.append({"file": os.path.basename(filepath),
-                              "path": filepath, "width": w, "height": h})
-            except Exception as e:
-                messagebox.showerror("Save Error",
-                                     f"Failed to save {name}: {e}")
+        # /close uses sendBeacon with URL-encoded form data
+        if self.path == "/close":
+            from urllib.parse import parse_qs
+            params = parse_qs(body.decode())
+            if params.get("csrf", [None])[0] != CSRF_TOKEN:
+                self.send_error(403)
                 return
-
-        print(json.dumps({"action": "saved", "directory": self.save_dir,
-                          "files": saved}))
-        self.root.destroy()
-
-    def discard_all(self):
-        if self.images and not messagebox.askyesno(
-                "Discard All", "Discard all screenshots without saving?"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"ok")
+            output_and_shutdown({"action": "closed", "directory": SAVE_DIR, "files": []})
             return
-        print(json.dumps({"action": "discarded", "directory": self.save_dir,
-                          "files": []}))
-        self.root.destroy()
 
-    def run(self):
-        self.root.mainloop()
+        # JSON endpoints
+        try:
+            data = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self.send_error(400)
+            return
+
+        if data.get("csrf") != CSRF_TOKEN:
+            self.send_error(403)
+            return
+
+        if self.path == "/discard":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"ok":true}')
+            output_and_shutdown({"action": "discarded", "directory": SAVE_DIR, "files": []})
+            return
+
+        if self.path == "/save":
+            result = save_images(data.get("images", []))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"ok":true}')
+            output_and_shutdown(result)
+            return
+
+        self.send_error(404)
+
+
+def sanitize_name(name, fallback_index):
+    """Sanitize a screenshot name for use as a filename."""
+    name = name.strip()
+    if not name:
+        name = f"screenshot-{fallback_index}"
+    name = "".join(c for c in name if c.isalnum() or c in "-_. ").strip()
+    name = name.lstrip(". ")
+    if not name:
+        name = f"screenshot-{fallback_index}"
+    return name
+
+
+def save_images(image_list):
+    """Decode base64 images and save to disk. Returns JSON result dict."""
+    saved = []
+    for i, entry in enumerate(image_list, 1):
+        name = sanitize_name(entry.get("name", ""), i)
+        data_url = entry.get("dataUrl", "")
+
+        # Strip data URL prefix
+        if "," in data_url:
+            b64 = data_url.split(",", 1)[1]
+        else:
+            b64 = data_url
+
+        try:
+            img_data = base64.b64decode(b64)
+        except Exception:
+            continue
+
+        # Get dimensions from PNG header
+        width, height = png_dimensions(img_data)
+        if width is None:
+            # Fallback to what the browser reported
+            width = entry.get("width", 0)
+            height = entry.get("height", 0)
+
+        filepath = os.path.join(SAVE_DIR, f"{name}.png")
+
+        # Handle name collisions
+        if os.path.exists(filepath):
+            base = name
+            n = 1
+            while os.path.exists(os.path.join(SAVE_DIR, f"{base}-{n}.png")):
+                n += 1
+            filepath = os.path.join(SAVE_DIR, f"{base}-{n}.png")
+
+        try:
+            with open(filepath, "wb") as f:
+                f.write(img_data)
+            saved.append({
+                "file": os.path.basename(filepath),
+                "path": filepath,
+                "width": width,
+                "height": height,
+            })
+        except OSError as e:
+            print(f"Warning: failed to save {name}: {e}", file=sys.stderr)
+
+    return {"action": "saved", "directory": SAVE_DIR, "files": saved}
+
+
+def output_and_shutdown(result):
+    """Print JSON to stdout and shut down the server from a background thread."""
+    def _shutdown():
+        time.sleep(0.5)  # Let browser receive response before shutdown
+        print(json.dumps(result))
+        sys.stdout.flush()
+        server_instance.shutdown()
+    threading.Thread(target=_shutdown, daemon=True).start()
+
+
+def heartbeat_watchdog():
+    """Detect browser tab closure via missing pings."""
+    global last_ping
+    while True:
+        time.sleep(5)
+        if last_ping > 0 and (time.monotonic() - last_ping) > 10:
+            output_and_shutdown({"action": "closed", "directory": SAVE_DIR, "files": []})
+            return
 
 
 def main():
-    save_dir = sys.argv[1] if len(sys.argv) > 1 else os.getcwd()
+    global SAVE_DIR, CSRF_TOKEN, server_instance, last_ping
 
-    if not os.path.isdir(save_dir):
-        print(f"Error: {save_dir} is not a valid directory")
+    SAVE_DIR = sys.argv[1] if len(sys.argv) > 1 else os.getcwd()
+
+    if not os.path.isdir(SAVE_DIR):
+        print(f"Error: {SAVE_DIR} is not a valid directory", file=sys.stderr)
         sys.exit(1)
 
-    app = ScreenshotManager(save_dir)
-    app.run()
+    CSRF_TOKEN = secrets.token_urlsafe(32)
+
+    # Find a free port
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+
+    server_instance = HTTPServer(("127.0.0.1", port), Handler)
+    last_ping = time.monotonic()
+
+    url = f"http://127.0.0.1:{port}"
+    print(f"Screenshot Manager running at {url}", file=sys.stderr)
+
+    # Start heartbeat watchdog
+    threading.Thread(target=heartbeat_watchdog, daemon=True).start()
+
+    # Open browser
+    try:
+        webbrowser.open(url)
+    except Exception:
+        print(f"Could not open browser. Open this URL manually: {url}", file=sys.stderr)
+
+    server_instance.serve_forever()
 
 
 if __name__ == "__main__":
