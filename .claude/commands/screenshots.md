@@ -19,12 +19,10 @@ Run the screenshot manager as a **background Bash task** (using `run_in_backgrou
 screenshot-manager "$PWD"
 ```
 
-After launching, tell the user the browser tab is open and remind them of the shortcuts:
+After launching, read the background task output to get the URL, then tell the user the shortcuts:
 - **Ctrl+V** to capture a screenshot from clipboard
 - **Ctrl+S** to save all and close
 - **Esc** to close without saving
-
-**SSH note:** If Claude Code is running on a remote machine, the browser won't open automatically. The URL is printed to stderr — tell the user to open it manually on their local machine (it won't work since the server is on the remote host). For SSH use cases, users should run the screenshot manager directly on their local machine instead.
 
 ## Getting results
 
