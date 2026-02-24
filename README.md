@@ -10,7 +10,7 @@ You can paste images into Claude Code's chat, but sometimes you need the screens
 
 ## What it does
 
-Type `/screenshots` in Claude Code and a GUI window opens where you can:
+Type `/screenshots` in Claude Code and a browser tab opens where you can:
 
 - **Ctrl+V** — capture a screenshot from your clipboard
 - Name each screenshot
@@ -20,10 +20,7 @@ Claude gets structured JSON output with the saved file paths and dimensions, so 
 
 ## Prerequisites
 
-- Python 3 with tkinter
-- [Pillow](https://pypi.org/project/Pillow/) — `pip install Pillow`
-- **Linux only:** `wl-paste` (Wayland) or `xclip` (X11) for clipboard access
-- **macOS / Windows:** clipboard access works out of the box via Pillow
+- Python 3 (standard library only — no pip packages needed)
 
 ## Install
 
@@ -45,7 +42,11 @@ In any Claude Code session:
 /screenshots
 ```
 
-Claude will launch the manager window in the background. Take your screenshots, paste and name them, then save. Claude picks up the results automatically.
+Claude will launch the manager in a browser tab in the background. Take your screenshots, paste and name them, then save. Claude picks up the results automatically.
+
+## How it works
+
+The script starts a local HTTP server on a random port (bound to `127.0.0.1` only) and opens a browser tab pointing to it. All image handling happens in the browser — clipboard paste, preview, naming. When you save, the browser sends the images to the server which writes them to disk and prints JSON results to stdout for Claude to pick up.
 
 ## Uninstall
 

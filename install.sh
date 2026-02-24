@@ -35,23 +35,10 @@ cp "$SCRIPT_DIR/.claude/commands/screenshots.md" "$SKILL_DIR/screenshots.md"
 echo "Installed Claude Code skill to $SKILL_DIR/screenshots.md"
 
 # Check dependencies
-missing=()
-python3 -c "import tkinter" 2>/dev/null || missing+=("tkinter (apt install python3-tk, or dnf install python3-tkinter)")
-python3 -c "import PIL" 2>/dev/null || missing+=("Pillow (pip install Pillow)")
-
-case "$(uname -s)" in
-    Linux*)
-        command -v wl-paste &>/dev/null || command -v xclip &>/dev/null || \
-            missing+=("wl-paste or xclip (for clipboard access)")
-        ;;
-esac
-
-if [[ ${#missing[@]} -gt 0 ]]; then
+if ! command -v python3 &>/dev/null; then
     echo ""
-    echo "Missing dependencies:"
-    for dep in "${missing[@]}"; do
-        echo "  - $dep"
-    done
+    echo "Missing dependency:"
+    echo "  - Python 3 (required)"
 fi
 
 echo ""
